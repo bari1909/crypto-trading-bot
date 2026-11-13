@@ -1,0 +1,103 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: scalper
+      POSTGRES_PASSWORD: scalper
+      POSTGRES_DB: scalper
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scalper -d scalper"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  worker:
+    build: .
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: .env
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  dashboard:
+    build: .
+    command: ["streamlit", "run", "dashboard/main.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    env_file: .env
+    environment:
+      API_URL: http://api:8000
+    ports: ["127.0.0.1:8501:8501"]
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  telegram:
+    build: .
+    command: ["python", "-m", "app.telegram_bot"]
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------- Futures bot (long + short perps, 1x). Separate database = separate ledger. ----------------
+  # Paper by default; set FUTURES_TRADING_MODE=testnet in .env (plus futures testnet keys) to send test orders.
+  futures-worker:
+    build: .
+    env_file: .env
+    environment: &futures_env
+      MARKET: futures
+      TRADING_MODE: ${FUTURES_TRADING_MODE:-paper}
+      DATABASE_URL: postgresql+psycopg://scalper:scalper@db:5432/scalper_futures
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  futures-api:
+    build: .
+    command: ["uvicorn", "app.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: .env
+    environment: *futures_env
+    ports: ["127.0.0.1:8001:8000"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  futures-dashboard:
+    build: .
+    command: ["streamlit", "run", "dashboard/main.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    env_file: .env
+    environment:
+      <<: *futures_env
+      API_URL: http://futures-api:8000
+    ports: ["127.0.0.1:8502:8501"]
+    depends_on:
+      - futures-api
+    restart: unless-stopped
+
+  # On-demand: docker compose run --rm backtest   (add: --days 730 --strategies a,b)
+  backtest:
+    build: .
+    entrypoint: ["python", "-m", "app.backtest"]
+    command: ["--days", "365"]
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    profiles: ["tools"]
+
+volumes:
+  pgdata:
